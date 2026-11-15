@@ -28,16 +28,19 @@ def load():
 def churn_table(f):
     """Songs entering / leaving each day (only days next to a data day)."""
     by_day = f.groupby("date")["song_id"].apply(set)
-    rows = []
+    rows, events = [], []
     for prev, cur in zip(by_day.index[:-1], by_day.index[1:]):
         if (cur - prev).days != 1:
             continue
-        rows.append({"date": cur, "entries": len(by_day[cur] - by_day[prev]),
+        new = by_day[cur] - by_day[prev]
+        rows.append({"date": cur, "entries": len(new),
                      "exits": len(by_day[prev] - by_day[cur])})
+        events += [(cur, sid) for sid in new]
     c = pd.DataFrame(rows, columns=["date", "entries", "exits"])
     c["churn_pct"] = c["entries"] / 50 * 100
     c["month"] = c["date"].dt.to_period("M").astype(str)
-    return c
+    e = pd.DataFrame(events, columns=["date", "song_id"])
+    return c, e
 
 
 def songs_view(f, life):
@@ -51,6 +54,7 @@ def songs_view(f, life):
                                        "duration_group", "album_size"]]
     v = v.join(extra)
     v["label"] = v["song"] + " - " + v["artist"]
+    v["content"] = np.where(v["is_explicit"], "Explicit", "Clean")
     return v
 
 
@@ -94,7 +98,7 @@ if f.empty:
     st.warning("No songs match these filters. Widen the date range or select more options.")
 else:
     sv = songs_view(f, life)
-    ch = churn_table(f_content)
+    ch, ev = churn_table(f_content)
 
     rsi_song = f.groupby("song_id")["daily_move"].mean()
     rsi_song = rsi_song[sv.loc[rsi_song.index, "days"] >= 7]
@@ -142,13 +146,37 @@ else:
     with t2:
         st.subheader("Entry vs exit flow")
         if len(ch):
-            fig, ax = plt.subplots(figsize=(11, 4))
-            ax.plot(ch["date"], ch["entries"].rolling(7, min_periods=1).mean(), color=GREEN, label="Entries")
-            ax.plot(ch["date"], ch["exits"].rolling(7, min_periods=1).mean(), color=RED, label="Exits")
+            if (ch["entries"] == ch["exits"]).all():
+                st.info("The Top 50 always holds exactly 50 songs, so with every song included, "
+                        "songs entering = songs leaving each day (the two lines are identical). "
+                        "The useful question is WHO enters, shown in the charts below. "
+                        "Pick 'Explicit only' or 'Single' in the filters to see entries and exits separate.")
+            fig, ax = plt.subplots(figsize=(11, 3.8))
+            ax.plot(ch["date"], ch["entries"].rolling(7, min_periods=1).mean(), color=GREEN, lw=2, label="Entries")
+            ax.plot(ch["date"], ch["exits"].rolling(7, min_periods=1).mean(), color=RED, lw=1.5, ls="--", label="Exits")
             ax.set_ylabel("Songs per day (7-day average)")
             ax.legend()
             st.pyplot(fig)
             plt.close(fig)
+            if len(ev):
+                ev2 = ev.merge(life[["song_id", "is_explicit", "album_type"]], on="song_id")
+                ev2["month"] = ev2["date"].dt.to_period("M").astype(str)
+                ev2["content"] = np.where(ev2["is_explicit"], "Explicit", "Clean")
+                a_, b_ = st.columns(2)
+                fig, ax = plt.subplots(figsize=(5.5, 4))
+                pd.crosstab(ev2["month"], ev2["album_type"]).plot(kind="bar", stacked=True, ax=ax,
+                                                                   color=[GREEN, "#145a32"])
+                ax.set_title("New entries per month: single vs album")
+                ax.legend(fontsize=8)
+                a_.pyplot(fig)
+                plt.close(fig)
+                fig, ax = plt.subplots(figsize=(5.5, 4))
+                pd.crosstab(ev2["month"], ev2["content"]).plot(kind="bar", stacked=True, ax=ax,
+                                                               color=["#145a32", GREEN])
+                ax.set_title("New entries per month: clean vs explicit")
+                ax.legend(fontsize=8)
+                b_.pyplot(fig)
+                plt.close(fig)
             m = ch.groupby("month")[["entries", "exits"]].sum()
             m["net"] = m["entries"] - m["exits"]
             st.write("Monthly totals")
@@ -177,7 +205,7 @@ else:
         mix.plot(kind="bar", stacked=True, ax=ax, colormap="Greens")
         ax.set_ylabel("% of song-days")
         ax.set_title("Stage mix by month")
-        ax.legend(fontsize=8, ncol=5)
+        ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1, 0.5))
         st.pyplot(fig)
         plt.close(fig)
 
@@ -185,7 +213,7 @@ else:
     with t4:
         st.subheader("Content maturity comparisons (average days on playlist)")
         fig, ax = plt.subplots(1, 4, figsize=(14, 3.6))
-        for a_, col, order in zip(ax, ["is_explicit", "album_type", "duration_group", "album_size"],
+        for a_, col, order in zip(ax, ["content", "album_type", "duration_group", "album_size"],
                                   [None, None, DUR, SIZE]):
             s = sv.groupby(col)["days"].mean()
             if order:
@@ -196,7 +224,7 @@ else:
         st.pyplot(fig)
         plt.close(fig)
         st.write("Details")
-        for col in ["is_explicit", "album_type", "duration_group", "album_size"]:
+        for col in ["content", "album_type", "duration_group", "album_size"]:
             st.dataframe(sv.groupby(col).agg(songs=("days", "size"),
                                              avg_days=("days", "mean"),
                                              median_days=("days", "median"),
